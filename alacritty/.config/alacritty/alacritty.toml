@@ -1,0 +1,6 @@
+[general]
+import = [
+	"~/.config/alacritty/themes/themes/catppuccin_mocha.toml"
+	]
+[font]
+normal = { family = "MesloLGSDZ Nerd Font", style = "Regular" }
