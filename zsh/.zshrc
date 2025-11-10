@@ -11,6 +11,8 @@ alias grep=rg
 alias cat=bat
 alias la='ls -la'
 alias htop=btop
+alias ls=eza
+alias cd=z
 
 autoload -Uz compinit
 compinit
@@ -26,7 +28,6 @@ export NVM_DIR="$HOME/.nvm"
 [ -s "$NVM_DIR/bash_completion" ] && \. "$NVM_DIR/bash_completion"  # This loads nvm bash_completion
 
 export PATH=~/bin:$PATH
-export PATH=$PATH:/usr/local/go/bin
 
 function y() {
 	local tmp="$(mktemp -t "yazi-cwd.XXXXXX")" cwd
@@ -36,3 +37,8 @@ function y() {
 	rm -f -- "$tmp"
 }
 export EDITOR=nvim
+eval "$(zoxide init zsh)"
+
+if [[ -z $DISPLAY ]] && [[ $(tty) = /dev/tty1 ]]; then
+  exec startx
+fi
