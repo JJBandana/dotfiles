@@ -70,6 +70,9 @@ bindsym Mod4+space exec rofi -show drun
 # .desktop file. It is a wrapper around dmenu, so you need that installed.
 # bindsym Mod4+d exec --no-startup-id i3-dmenu-desktop
 
+# take screenshot with maim and save it in the clipboard and screenshot folder
+bindsym Print exec --no-startup-id maim -s ~/Pictures/Screenshots/screenshot_$(date +'%Y-%m-%d_%H-%M-%S').png
+
 # change focus
 bindsym Mod4+$left focus left
 bindsym Mod4+$down focus down
@@ -213,9 +216,9 @@ bindsym Mod4+r mode "resize"
 #######################################################################
 exec i3-config-wizard
 exec --no-startup-id xsetroot -cursor_name left_ptr
+exec --no-startup-id clipmenud
 exec_always --no-startup-id picom --config ~/.config/picom/picom.conf
 exec_always --no-startup-id feh --bg-fill ~/Downloads/wallhaven-jexovp_1920x1080.png
-
 exec_always --no-startup-id ~/.config/polybar/launch.sh
 
 for_window [class=".*"] border pixel 0
