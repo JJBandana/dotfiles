@@ -8,7 +8,6 @@ bindkey -v
 zstyle :compinstall filename '/home/jojo/.zshrc'
 alias vim=nvim
 alias grep=rg
-alias cat=bat
 alias la='ls -la'
 alias htop=btop
 alias ls=eza
@@ -41,5 +40,5 @@ export EDITOR=nvim
 eval "$(zoxide init zsh)"
 
 if [[ -z $DISPLAY ]] && [[ $(tty) = /dev/tty1 ]]; then
-  exec Hyprland
+  exec Hyprland || echo "Error: Couldn't run Hyprland, is it installed?"
 fi
