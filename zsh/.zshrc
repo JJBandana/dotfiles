@@ -12,7 +12,7 @@ alias cat=bat
 alias la='ls -la'
 alias htop=btop
 alias ls=eza
-alias cd=z
+alias cls=clear
 
 autoload -Uz compinit
 compinit
@@ -41,5 +41,5 @@ export EDITOR=nvim
 eval "$(zoxide init zsh)"
 
 if [[ -z $DISPLAY ]] && [[ $(tty) = /dev/tty1 ]]; then
-  exec startx
+  exec Hyprland
 fi
