@@ -4,3 +4,8 @@ import = [
 	]
 [font]
 normal = { family = "MesloLGSDZ Nerd Font", style = "Regular" }
+
+[[keyboard.bindings]]
+key = "Return"
+mods = "Shift"
+chars = "\u001B\r"

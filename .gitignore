@@ -1,0 +1,5 @@
+# backups locales (no se suben)
+*.bak
+*.bak-*
+*.bak.*
+*-bak.*

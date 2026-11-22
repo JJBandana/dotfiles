@@ -3,39 +3,77 @@ HISTFILE=~/.histfile
 HISTSIZE=1000
 SAVEHIST=1000
 bindkey -v
-# End of lines configured by zsh-newuser-install
-# The following lines were added by compinstall
-zstyle :compinstall filename '/home/jojo/.zshrc'
-alias vim=nvim
-# alias grep=rg
-alias la='ls -la'
-alias ls=eza
-alias cls=clear
+export EDITOR=nvim
+export VISUAL=nvim
+
+export PNPM_HOME="$HOME/.local/share/pnpm"
+export BUN_INSTALL="$HOME/.bun"
+
+typeset -U path # -U evita duplicados en el PATH
+path=(
+  $BUN_INSTALL/bin
+  $PNPM_HOME
+  $HOME/.local/bin
+  $HOME/bin
+  $HOME/.cargo/bin
+  $path
+)
+export PATH
+
+[[ -t 0 ]] && stty erase '^?'
 
 autoload -Uz compinit
-compinit
-# End of lines added by compinstall
-export PATH=$PATH:/home/jojo/.local/bin
-export PATH=~/bin:$PATH
-export PATH=$HOME/.cargo/bin:$PATH
+zstyle :compinstall filename '$HOME/.zshrc'
+
+setopt extendedglob
+if [[ -n ~/.zcompdump(#qN.m-1) ]]; then
+  compinit -C -u
+else
+  compinit -u
+fi
+
+zcompdump="${ZDOTDIR:-$HOME}/.zcompdump"
+if [[ -s "$zcompdump" && (! -s "${zcompdump}.zwc" || "$zcompdump" -nt "${zcompdump}.zwc") ]]; then
+  zcompile "$zcompdump"
+fi
+
+# --- Aliases ---
+
+alias vim=nvim
+alias la='eza -la'
+alias cls=clear
+alias tree='eza --tree --level=3 --ignore-glob "node_modules|dist|build|.git"'
+alias myip="ip route get 1.1.1.1 | grep -oP 'src \K\S+'"
+alias git-ai="bun /home/jojo/Projects/git-commiter/git-ai.ts"
 
 function y() {
 	local tmp="$(mktemp -t "yazi-cwd.XXXXXX")" cwd
-	yazi "$@" --cwd-file="$tmp"
+	command yazi "$@" --cwd-file="$tmp"
 	IFS= read -r -d '' cwd < "$tmp"
-	[ -n "$cwd" ] && [ "$cwd" != "$PWD" ] && builtin cd -- "$cwd"
+	[ "$cwd" != "$PWD" ] && [ -d "$cwd" ] && builtin cd -- "$cwd"
 	rm -f -- "$tmp"
 }
 
-export EDITOR=nvim
-
 eval "$(atuin init zsh)"
 eval "$(zoxide init zsh)"
-eval "$(oh-my-posh init zsh --config "space")"
 
-if [[ -z $DISPLAY ]] && [[ $(tty) = /dev/tty1 ]]; then
-  exec Hyprland || echo "Error: Couldn't run Hyprland, is it installed?"
+# Bun completions
+[ -s "$HOME/.bun/_bun" ] && source "/home/jojo/.bun/_bun"
+
+# Google Cloud SDK
+if [ -d "$HOME/google-cloud-sdk" ]; then
+    # Cargar el path es barato
+    source "$HOME/google-cloud-sdk/path.zsh.inc"
+    # Cargar el autocompletado es CARO. 
+    # Solo lo cargamos si realmente estamos en una sesión de trabajo
+    [[ -f "$HOME/google-cloud-sdk/completion.zsh.inc" ]] && source "$HOME/google-cloud-sdk/completion.zsh.inc"
 fi
 
-export NVM_DIR="$HOME/.nvm"
-[ -s "/usr/share/nvm/init-nvm.sh" ] && source /usr/share/nvm/init-nvm.sh
+eval "$(oh-my-posh init zsh --config "space")"
+
+
+# Added by Antigravity CLI installer
+export PATH="/home/jojo/.local/bin:$PATH"
+
+# opencode
+export PATH=/home/jojo/.opencode/bin:$PATH

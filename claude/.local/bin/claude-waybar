@@ -1,0 +1,659 @@
+#!/usr/bin/env python3
+"""claude-waybar: muestra tus sesiones de Claude Code en Waybar.
+
+Subcomandos:
+  hook     Lo llaman los hooks de Claude Code (lee el JSON del evento por stdin).
+  status   Lo llama Waybar: imprime el JSON del módulo.
+  focus    Enfoca la sesión que más necesita atención (esperando > terminada > trabajando).
+  menu     Abre un menú (wofi) para elegir qué sesión enfocar.
+  clear    Marca las sesiones terminadas como vistas.
+  goto N   Enfoca la sesión número N (orden estable por inicio).
+  next     Enfoca la siguiente sesión (relativa a la ventana activa).
+  prev     Enfoca la sesión anterior.
+  mode     Refresca Waybar (al entrar/salir del submap "claude").
+  speak    Lee en voz alta (piper) un resumen del último mensaje (lo lanza el hook Stop).
+  mute     Silencia/activa la voz (y corta lo que se esté diciendo).
+  statusline  statusLine de Claude Code: guarda límites de uso y % de contexto.
+  usage    Lo llama Waybar: imprime el JSON del módulo de uso (5h / semanal).
+"""
+import fcntl
+import html
+import json
+import os
+import re
+import urllib.request
+import signal
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+STATE_DIR = Path(os.environ.get("XDG_RUNTIME_DIR", "/tmp")) / "claude-waybar"
+SUBMAP = os.environ.get("CLAUDE_WAYBAR_SUBMAP", "claude")
+SIGNAL = int(os.environ.get("CLAUDE_WAYBAR_SIGNAL", "11"))
+NOTIFY = os.environ.get("CLAUDE_WAYBAR_NOTIFY", "1") != "0"
+
+# TTS: piper + resumen con ollama
+TTS = os.environ.get("CLAUDE_WAYBAR_TTS", "1") != "0"
+PIPER = os.path.expanduser(os.environ.get("CLAUDE_WAYBAR_PIPER", "~/.local/share/piper/.venv/bin/piper"))
+VOICE = os.path.expanduser(os.environ.get("CLAUDE_WAYBAR_VOICE", "~/.local/share/piper/es_ES-sharvard-medium.onnx"))
+SPEAKER = os.environ.get("CLAUDE_WAYBAR_SPEAKER", "0")  # 0 = M, 1 = F
+OLLAMA_URL = os.environ.get("OLLAMA_HOST", "http://localhost:11434").rstrip("/")
+OLLAMA_MODEL = os.environ.get("CLAUDE_WAYBAR_MODEL", "qwen2.5-coder:1.5b")
+MUTE_FILE = STATE_DIR / "tts-muted"
+SPEAK_DIR = STATE_DIR / "speak"
+SPEAK_LOCK = SPEAK_DIR / "speak.lock"
+SUMMARY_PROMPT = (
+    "Eres un asistente que convierte el mensaje final de un agente de programación en un "
+    "resumen para ser LEÍDO EN VOZ ALTA. Reglas estrictas:\n"
+    "- Responde SOLO en español.\n"
+    "- Máximo 4 frases cortas, en primera persona, como si el agente hablara (\"Terminé...\", \"Agregué...\").\n"
+    "- Di qué se hizo, el resultado y si el usuario tiene que hacer o decidir algo.\n"
+    "- Nada de markdown, listas, código, rutas de archivos, URLs, comandos ni emojis.\n"
+    "- No inventes nada: usa solo lo que dice el mensaje.\n"
+    "- No agregues introducciones como \"Resumen:\" ni comentarios tuyos.\n\n"
+    "Mensaje del agente:\n"
+)
+
+# Catppuccin Mocha (igual que tu style.css)
+C = {
+    "working": "#f9e2af",  # yellow
+    "waiting": "#f38ba8",  # red
+    "done": "#a6e3a1",     # green
+    "idle": "#6c7086",     # overlay0
+    "text": "#cdd6f4",
+    "dim": "#7f849c",
+}
+ICON = {"working": "󰔟", "waiting": "󰂞", "done": "󰄬", "idle": "󰒲"}
+LABEL = {"working": "trabajando", "waiting": "esperándote", "done": "terminó", "idle": "inactiva"}
+PRIORITY = {"waiting": 0, "done": 1, "working": 2, "idle": 3}
+CLAUDE_ICON = "󰚩"
+USAGE_FILE = STATE_DIR / "usage.json"
+DIAS = ["lun", "mar", "mié", "jue", "vie", "sáb", "dom"]
+
+
+# ---------------------------------------------------------------- utilidades
+def proc_info(pid):
+    """(comm, ppid) de un proceso, o (None, None)."""
+    try:
+        stat = Path(f"/proc/{pid}/stat").read_text()
+        comm = stat[stat.index("(") + 1 : stat.rindex(")")]
+        ppid = int(stat[stat.rindex(")") + 2 :].split()[1])
+        return comm, ppid
+    except (OSError, ValueError, IndexError):
+        return None, None
+
+
+def ancestors(pid):
+    chain = []
+    while pid and pid > 1 and len(chain) < 64:
+        comm, ppid = proc_info(pid)
+        if comm is None:
+            break
+        chain.append((pid, comm))
+        pid = ppid
+    return chain
+
+
+def alive(pid):
+    if not pid:
+        return False
+    try:
+        os.kill(pid, 0)
+        return True
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+
+
+def hypr_clients():
+    try:
+        out = subprocess.run(["hyprctl", "clients", "-j"], capture_output=True, text=True, timeout=2).stdout
+        return json.loads(out)
+    except Exception:
+        return []
+
+
+def hypr_active_address():
+    try:
+        out = subprocess.run(["hyprctl", "activewindow", "-j"], capture_output=True, text=True, timeout=2).stdout
+        return json.loads(out).get("address")
+    except Exception:
+        return None
+
+
+def refresh_waybar():
+    sig = signal.SIGRTMIN + SIGNAL
+    for p in Path("/proc").iterdir():
+        if not p.name.isdigit():
+            continue
+        try:
+            if (p / "comm").read_text().strip() in ("waybar", ".waybar-wrapped"):
+                os.kill(int(p.name), sig)
+        except OSError:
+            pass
+
+
+def load_sessions():
+    sessions = []
+    if not STATE_DIR.is_dir():
+        return sessions
+    for f in STATE_DIR.glob("*.json"):
+        try:
+            s = json.loads(f.read_text())
+        except (OSError, ValueError):
+            continue
+        if not isinstance(s, dict) or s.get("session_id") != f.stem:
+            continue  # no es un archivo de sesión (usage.json, etc.)
+        if not alive(s.get("claude_pid")):
+            f.unlink(missing_ok=True)
+            continue
+        s["_file"] = f
+        sessions.append(s)
+    return sessions
+
+
+def ordered_sessions():
+    """Sesiones en orden estable (por inicio), para que los números no cambien."""
+    return sorted(load_sessions(), key=lambda s: (s.get("started", 0), s.get("session_id", "")))
+
+
+def in_submap():
+    try:
+        out = subprocess.run(["hyprctl", "submap"], capture_output=True, text=True, timeout=2).stdout
+        return out.strip() == SUBMAP
+    except Exception:
+        return False
+
+
+def short(name, n=14):
+    return name if len(name) <= n else name[: n - 1] + "…"
+
+
+def save(path, data):
+    data = {k: v for k, v in data.items() if not k.startswith("_")}
+    tmp = path.with_suffix(".tmp")
+    tmp.write_text(json.dumps(data))
+    tmp.replace(path)
+
+
+def ago(ts):
+    d = int(time.time() - ts)
+    if d < 60:
+        return f"{d}s"
+    if d < 3600:
+        return f"{d // 60}m"
+    return f"{d // 3600}h{(d % 3600) // 60:02d}m"
+
+
+# ---------------------------------------------------------------- hook
+def cmd_hook():
+    try:
+        ev = json.load(sys.stdin)
+    except ValueError:
+        return
+    sid = ev.get("session_id")
+    if not sid:
+        return
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    path = STATE_DIR / f"{sid}.json"
+    name = ev.get("hook_event_name", "")
+    now = time.time()
+
+    if name == "SessionEnd":
+        path.unlink(missing_ok=True)
+        refresh_waybar()
+        return
+
+    try:
+        s = json.loads(path.read_text())
+    except (OSError, ValueError):
+        s = {"session_id": sid, "status": "idle", "since": now}
+
+    s.setdefault("started", now)
+    s["cwd"] = ev.get("cwd") or s.get("cwd", "")
+    s["project"] = os.path.basename(s["cwd"].rstrip("/")) or "~"
+
+    # Localiza el proceso de claude y la ventana de terminal que lo contiene.
+    if not s.get("claude_pid") or not alive(s["claude_pid"]) or not s.get("window"):
+        chain = ancestors(os.getppid())
+        claude_pid = next((p for p, c in chain if c == "claude" or c.startswith("2.")), None)
+        s["claude_pid"] = claude_pid or os.getppid()
+        clients = hypr_clients()
+        by_pid = {c["pid"]: c["address"] for c in clients}
+        s["window"] = next((by_pid[p] for p, _ in chain if p in by_pid), None)
+
+    old = s.get("status")
+    new = old
+    if name == "SessionStart":
+        new = "idle"
+    elif name == "UserPromptSubmit":
+        new = "working"
+        prompt = " ".join((ev.get("prompt") or "").split())
+        s["prompt"] = prompt[:80] + ("…" if len(prompt) > 80 else "")
+    elif name in ("PreToolUse", "PostToolUse"):
+        new = "working"
+    elif name == "Notification":
+        ntype = ev.get("notification_type", "")
+        msg = ev.get("message", "")
+        if ntype == "idle_prompt" or "waiting for your input" in msg:
+            # Claude lleva un rato inactivo; si ya estaba "done" lo dejamos así.
+            new = old if old in ("done", "idle") else "waiting"
+        else:
+            new = "waiting"
+            s["message"] = msg
+    elif name == "Stop":
+        new = "done"
+    elif name == "SubagentStop":
+        pass
+
+    if new != old:
+        s["status"] = new
+        s["since"] = now
+        if new != "waiting":
+            s.pop("message", None)
+    s["updated"] = now
+    save(path, s)
+    refresh_waybar()
+
+    if new != old and new in ("waiting", "done"):
+        if s.get("window") and s["window"] == hypr_active_address():
+            return  # ya estás mirando esa terminal
+        if new == "done" and TTS and not MUTE_FILE.exists():
+            msg = ev.get("last_assistant_message") or last_assistant_from_transcript(ev.get("transcript_path"))
+            if msg:
+                SPEAK_DIR.mkdir(exist_ok=True)
+                job = SPEAK_DIR / f"job-{sid}-{int(now * 1000)}.json"
+                job.write_text(json.dumps({"project": s["project"], "message": msg}))
+                subprocess.Popen(
+                    [sys.executable, os.path.abspath(__file__), "speak", str(job)],
+                    stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                    start_new_session=True,
+                )
+    if NOTIFY and new != old and new in ("waiting", "done"):
+        body = s.get("message") if new == "waiting" else (s.get("prompt") or "Listo")
+        subprocess.Popen(
+            ["notify-send", "-a", "Claude Code", "-i", "dialog-information",
+             "-u", "critical" if new == "waiting" else "normal",
+             f"Claude · {s['project']} {LABEL[new]}", body or ""],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True,
+        )
+
+
+# ---------------------------------------------------------------- TTS
+def last_assistant_from_transcript(path):
+    """Plan B si el evento no trae last_assistant_message: lo saca del transcript."""
+    if not path:
+        return ""
+    try:
+        lines = Path(path).read_text().splitlines()[-200:]
+    except OSError:
+        return ""
+    for line in reversed(lines):
+        try:
+            e = json.loads(line)
+        except ValueError:
+            continue
+        if e.get("type") != "assistant":
+            continue
+        content = (e.get("message") or {}).get("content") or []
+        if isinstance(content, str):
+            return content
+        text = "\n".join(c.get("text", "") for c in content if c.get("type") == "text").strip()
+        if text:
+            return text
+    return ""
+
+
+def strip_markdown(text):
+    text = re.sub(r"```.*?```", " ", text, flags=re.S)           # bloques de código
+    text = re.sub(r"`([^`]*)`", r"\1", text)                     # código en línea
+    text = re.sub(r"!?\[([^\]]*)\]\([^)]*\)", r"\1", text)        # links
+    text = re.sub(r"https?://\S+", " ", text)                    # URLs
+    text = re.sub(r"(?m)^\s*\|.*\|\s*$", " ", text)               # tablas
+    text = re.sub(r"(?m)^\s*(#+|[-*+]|\d+\.)\s+", "", text)        # encabezados / listas
+    text = re.sub(r"[*_~>#|]+", " ", text)                        # restos de markdown
+    text = re.sub(r"(?:~|\.{0,2})?/[\w.\-/]+", " ", text)            # rutas
+    text = re.sub(r"[^\w\s.,;:¿?¡!()%+\-'\"áéíóúüñÁÉÍÓÚÜÑ]", " ", text)  # íconos / emojis
+    return re.sub(r"\s+", " ", text).strip()
+
+
+def summarize(text):
+    body = json.dumps({
+        "model": OLLAMA_MODEL,
+        "prompt": SUMMARY_PROMPT + text[:4000],
+        "stream": False,
+        "keep_alive": "15m",
+        "options": {"temperature": 0.2, "num_predict": 220},
+    }).encode()
+    req = urllib.request.Request(f"{OLLAMA_URL}/api/generate", data=body,
+                                 headers={"Content-Type": "application/json"})
+    with urllib.request.urlopen(req, timeout=90) as r:
+        out = json.load(r).get("response", "")
+    out = strip_markdown(out)
+    out = re.sub(r"^(resumen|summary)\s*:\s*", "", out, flags=re.I)
+    return out
+
+
+def first_sentences(text, n=4):
+    parts = re.split(r"(?<=[.!?])\s+", text)
+    return " ".join(parts[:n])[:500]
+
+
+def cmd_speak():
+    job = Path(sys.argv[2]) if len(sys.argv) > 2 else None
+    if job:
+        try:
+            data = json.loads(job.read_text())
+        finally:
+            job.unlink(missing_ok=True)
+    else:  # prueba manual: echo "texto" | claude-waybar speak
+        data = {"project": "", "message": sys.stdin.read()}
+
+    clean = strip_markdown(data.get("message", ""))
+    if not clean:
+        return
+    try:
+        summary = summarize(clean) or first_sentences(clean)
+    except Exception:
+        summary = first_sentences(clean)
+    summary = first_sentences(summary)
+    if data.get("project"):
+        summary = f"En {data['project'].replace('-', ' ')}. {summary}"
+
+    SPEAK_DIR.mkdir(parents=True, exist_ok=True)
+    with open(SPEAK_LOCK, "w") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)  # cola: un resumen a la vez
+        if MUTE_FILE.exists():
+            return
+        wav = SPEAK_DIR / f"{os.getpid()}.wav"
+        try:
+            subprocess.run([PIPER, "-m", VOICE, "-s", SPEAKER, "-f", str(wav)],
+                           input=summary, text=True, capture_output=True, timeout=120)
+            if wav.exists():
+                player = subprocess.Popen(["pw-play", str(wav)])
+                (SPEAK_DIR / "speak.pid").write_text(str(player.pid))
+                player.wait()
+        finally:
+            wav.unlink(missing_ok=True)
+            (SPEAK_DIR / "speak.pid").unlink(missing_ok=True)
+
+
+def cmd_mute():
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    if MUTE_FILE.exists():
+        MUTE_FILE.unlink()
+        state = "activada"
+    else:
+        MUTE_FILE.touch()
+        state = "silenciada"
+        try:
+            os.kill(int((SPEAK_DIR / "speak.pid").read_text()), signal.SIGTERM)
+        except (OSError, ValueError):
+            pass
+    subprocess.run(["notify-send", "-a", "Claude Code", "-t", "1500", f"Voz de Claude {state}"],
+                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    refresh_waybar()
+
+
+# ---------------------------------------------------------------- uso / statusline
+def until(ts):
+    d = max(0, int(ts - time.time()))
+    if d < 3600:
+        return f"{d // 60}m"
+    if d < 86400:
+        return f"{d // 3600}h{(d % 3600) // 60:02d}m"
+    return f"{d // 86400}d{(d % 86400) // 3600}h"
+
+
+def when(ts):
+    t = time.localtime(ts)
+    hhmm = time.strftime("%H:%M", t)
+    if time.strftime("%Y%m%d", t) == time.strftime("%Y%m%d"):
+        return hhmm
+    return f"{DIAS[t.tm_wday]} {hhmm}"
+
+
+def pct_color(p):
+    return C["done"] if p < 50 else C["working"] if p < 80 else C["waiting"]
+
+
+def cmd_statusline():
+    try:
+        ev = json.load(sys.stdin)
+    except ValueError:
+        return
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    changed = False
+
+    rl = ev.get("rate_limits") or {}
+    windows = {k: {"pct": round(float(v["used_percentage"]), 1), "resets_at": int(v["resets_at"])}
+               for k, v in rl.items()
+               if isinstance(v, dict) and v.get("used_percentage") is not None and v.get("resets_at")}
+    if windows:
+        try:
+            old = json.loads(USAGE_FILE.read_text())
+        except (OSError, ValueError):
+            old = {}
+        if old.get("windows") != windows:
+            save(USAGE_FILE, {"windows": windows, "updated": time.time()})
+            changed = True
+
+    ctx = (ev.get("context_window") or {}).get("used_percentage")
+    sid = ev.get("session_id")
+    path = STATE_DIR / f"{sid}.json" if sid else None
+    if ctx is not None and path and path.exists():
+        try:
+            sess = json.loads(path.read_text())
+            if sess.get("ctx") != round(ctx):
+                sess["ctx"] = round(ctx)
+                save(path, sess)
+                changed = True
+        except (OSError, ValueError):
+            pass
+    if changed:
+        refresh_waybar()
+
+    # Línea de estado para la terminal
+    parts = [(ev.get("model") or {}).get("display_name", "Claude")]
+    if ctx is not None:
+        parts.append(f"ctx {round(ctx)}%")
+    if "five_hour" in windows:
+        w = windows["five_hour"]
+        parts.append(f"5h {w['pct']:.0f}% ↻{when(w['resets_at'])}")
+    if "seven_day" in windows:
+        parts.append(f"sem {windows['seven_day']['pct']:.0f}%")
+    print(" · ".join(parts))
+
+
+def cmd_usage():
+    try:
+        windows = json.loads(USAGE_FILE.read_text()).get("windows", {})
+    except (OSError, ValueError):
+        windows = {}
+    now = time.time()
+    names = {"five_hour": "5 horas", "seven_day": "Semanal", "seven_day_opus": "Semanal Opus",
+             "seven_day_sonnet": "Semanal Sonnet"}
+    live = {k: w for k, w in windows.items() if w["resets_at"] > now}
+    main = live.get("five_hour") or live.get("seven_day")
+    if not main:
+        if windows:  # ventanas vencidas: ya se reiniciaron
+            print(json.dumps({"text": f"<span color='{C['done']}'>󰔛 0%</span>", "class": "low",
+                              "tooltip": "Límites reiniciados (se actualiza con el próximo mensaje)"}))
+        else:
+            print(json.dumps({"text": "", "class": "empty", "tooltip": ""}))
+        return
+
+    p = main["pct"]
+    text = f"<span color='{pct_color(p)}'>󰔛 {p:.0f}%</span> <span color='{C['dim']}'>↻{when(main['resets_at'])}</span>"
+    if "seven_day" in live and main is not live["seven_day"]:
+        wp = live["seven_day"]["pct"]
+        text += f"  <span color='{pct_color(wp)}'>󰃭 {wp:.0f}%</span>"
+
+    lines = ["<b>Uso del plan de Claude</b>", ""]
+    for k in ("five_hour", "seven_day", "seven_day_opus", "seven_day_sonnet"):
+        if k not in live:
+            continue
+        w = live[k]
+        filled = int(round(w["pct"] / 10))
+        bar = "█" * filled + "░" * (10 - filled)
+        lines.append(f"<b>{names[k]}</b>  <span color='{pct_color(w['pct'])}'>{bar} {w['pct']:.0f}%</span>")
+        lines.append(f"<span color='{C['dim']}'>  se reinicia {when(w['resets_at'])} (en {until(w['resets_at'])})</span>")
+    try:
+        upd = json.loads(USAGE_FILE.read_text()).get("updated", now)
+        lines += ["", f"<span color='{C['dim']}'>actualizado hace {ago(upd)}</span>"]
+    except (OSError, ValueError):
+        pass
+    cls = "low" if p < 50 else "mid" if p < 80 else "high"
+    print(json.dumps({"text": text, "tooltip": "\n".join(lines), "class": cls}))
+
+
+# ---------------------------------------------------------------- status
+def cmd_status():
+    sessions = ordered_sessions()
+    mode = in_submap()
+    if not sessions:
+        if mode:
+            print(json.dumps({"text": f"{CLAUDE_ICON}  sin sesiones", "class": "mode", "tooltip": ""}))
+        else:
+            print(json.dumps({"text": "", "class": "empty", "tooltip": ""}))
+        return
+    num = {s["session_id"]: i + 1 for i, s in enumerate(sessions)}
+
+    titles = {c["address"]: c.get("title", "") for c in hypr_clients()}
+    counts = {k: 0 for k in PRIORITY}
+    for s in sessions:
+        counts[s.get("status", "idle")] = counts.get(s.get("status", "idle"), 0) + 1
+
+    parts = [f"<span color='{C['text']}'>{CLAUDE_ICON}</span>"]
+    for st in ("waiting", "working", "done"):
+        if counts[st]:
+            parts.append(f"<span color='{C[st]}'>{ICON[st]} {counts[st]}</span>")
+    if len(parts) == 1:
+        parts.append(f"<span color='{C['idle']}'>{counts['idle']}</span>")
+    text = "  ".join(parts)
+    if mode:
+        text = "   ".join(
+            f"<span color='{C['text']}'><b>{num[s['session_id']]}</b></span> "
+            f"<span color='{C[s.get('status', 'idle')]}'>{ICON[s.get('status', 'idle')]} "
+            f"{html.escape(short(s.get('project', '?')))}</span>"
+            for s in sessions[:9]
+        )
+
+    sessions.sort(key=lambda s: (PRIORITY.get(s.get("status"), 9), -s.get("since", 0)))
+    lines = [f"<b>Sesiones de Claude ({len(sessions)})</b>", ""]
+    for s in sessions:
+        st = s.get("status", "idle")
+        title = titles.get(s.get("window"), "").lstrip("✳◐◓◑◒⠂⠐⠈⠁⠄⠠⠀ ").strip()
+        detail = s.get("message") if st == "waiting" else (title or s.get("prompt") or "")
+        ctx = f" · ctx {s['ctx']}%" if s.get("ctx") is not None else ""
+        lines.append(
+            f"<span color='{C['dim']}'>{num[s['session_id']]}</span> "
+            f"<span color='{C[st]}'>{ICON[st]}</span>  <b>{html.escape(s.get('project', '?'))}</b>"
+            f"  <span color='{C['dim']}'>{LABEL[st]} · {ago(s.get('since', time.time()))}"
+            f"{ctx}</span>"
+        )
+        if detail:
+            lines.append(f"     <span color='{C['dim']}'>{html.escape(detail[:90])}</span>")
+    lines += ["", f"<span color='{C['dim']}'>SUPER+C: modo teclado (1-9 ir · n/p navegar · a atención · c limpiar · s voz · Esc salir)</span>"]
+    if MUTE_FILE.exists():
+        text += f"  <span color='{C['idle']}'>󰖁</span>"
+
+    top = min((PRIORITY.get(s.get("status"), 9) for s in sessions), default=3)
+    cls = next(k for k, v in PRIORITY.items() if v == top)
+    if mode:
+        cls = ["mode", cls]
+    print(json.dumps({"text": text, "tooltip": "\n".join(lines), "class": cls, "alt": "mode" if mode else cls}))
+
+
+# ---------------------------------------------------------------- acciones
+def focus(s):
+    if s.get("window"):
+        subprocess.run(["hyprctl", "dispatch", "focuswindow", f"address:{s['window']}"],
+                       stdout=subprocess.DEVNULL)
+    if s.get("status") == "done":
+        s["status"] = "idle"
+        s["since"] = time.time()
+        save(s["_file"], s)
+        refresh_waybar()
+
+
+def cmd_focus():
+    sessions = load_sessions()
+    if not sessions:
+        return
+    sessions.sort(key=lambda s: (PRIORITY.get(s.get("status"), 9), -s.get("since", 0)))
+    focus(sessions[0])
+
+
+def cmd_menu():
+    sessions = load_sessions()
+    if not sessions:
+        return
+    sessions.sort(key=lambda s: (PRIORITY.get(s.get("status"), 9), -s.get("since", 0)))
+    entries = [
+        f"{i}: {ICON[s.get('status','idle')]}  {s.get('project')}  —  {LABEL[s.get('status','idle')]} "
+        f"({ago(s.get('since', time.time()))})  {s.get('prompt', '')[:50]}"
+        for i, s in enumerate(sessions)
+    ]
+    try:
+        r = subprocess.run(["wofi", "--dmenu", "--prompt", "Sesión de Claude", "--insensitive"],
+                           input="\n".join(entries), capture_output=True, text=True)
+    except FileNotFoundError:
+        return
+    choice = r.stdout.strip()
+    if choice and choice.split(":", 1)[0].isdigit():
+        focus(sessions[int(choice.split(":", 1)[0])])
+
+
+def cmd_goto():
+    try:
+        n = int(sys.argv[2])
+    except (IndexError, ValueError):
+        return
+    sessions = ordered_sessions()
+    if 1 <= n <= len(sessions):
+        focus(sessions[n - 1])
+
+
+def step(delta):
+    sessions = ordered_sessions()
+    if not sessions:
+        return
+    active = hypr_active_address()
+    idx = next((i for i, s in enumerate(sessions) if s.get("window") == active), None)
+    if idx is None:
+        idx = -1 if delta > 0 else 0
+    focus(sessions[(idx + delta) % len(sessions)])
+
+
+def cmd_clear():
+    for s in load_sessions():
+        if s.get("status") == "done":
+            s["status"] = "idle"
+            s["since"] = time.time()
+            save(s["_file"], s)
+    refresh_waybar()
+
+
+def main():
+    cmd = sys.argv[1] if len(sys.argv) > 1 else "status"
+    fn = {"hook": cmd_hook, "status": cmd_status, "focus": cmd_focus,
+          "menu": cmd_menu, "clear": cmd_clear, "goto": cmd_goto,
+          "next": lambda: step(1), "prev": lambda: step(-1), "mode": refresh_waybar,
+          "speak": cmd_speak, "mute": cmd_mute,
+          "statusline": cmd_statusline, "usage": cmd_usage}.get(cmd)
+    if not fn:
+        print(__doc__)
+        sys.exit(1)
+    try:
+        fn()
+    except Exception as e:  # un hook nunca debe romper Claude
+        if cmd != "hook":
+            raise
+        print(f"claude-waybar: {e}", file=sys.stderr)
+
+
+if __name__ == "__main__":
+    main()

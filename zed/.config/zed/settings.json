@@ -1,0 +1,46 @@
+{
+    "terminal": {
+        "env": {},
+        "font_family": "MesloLGM Nerd Font"
+    },
+    "base_keymap": "VSCode",
+    "cursor_blink": true,
+    "buffer_font_fallbacks": [
+        "Consolas",
+        "Courier New",
+        "monospace"
+    ],
+    "buffer_font_family": "Cascadia Mono",
+    "file_types": {
+        "svelte": [
+            "*.svelte"
+        ]
+    },
+    "linked_edits": true,
+    "tab_size": 2,
+    "telemetry": {
+        "diagnostics": false,
+        "metrics": false
+    },
+    "vim_mode": true,
+    "icon_theme": {
+        "mode": "dark",
+        "light": "Zed (Default)",
+        "dark": "Zed (Default)"
+    },
+    "ui_font_size": 16,
+    "buffer_font_size": 15,
+    "theme": {
+        "mode": "dark",
+        "light": "Ayu Dark",
+        "dark": "One Dark"
+    },
+    "context_servers": {
+        "codebase-memory-mcp": {
+            "command": "/home/jojo/.local/bin/codebase-memory-mcp",
+            "args": [
+                ""
+            ]
+        }
+    }
+}
