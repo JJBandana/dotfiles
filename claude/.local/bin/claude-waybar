@@ -188,6 +188,49 @@ def ago(ts):
 
 
 # ---------------------------------------------------------------- hook
+def describe_tool(name, inp):
+    """Descripción corta de lo que Claude quiere hacer (sin LLM)."""
+    inp = inp or {}
+    if name == "Bash":
+        cmd = " ".join(str(inp.get("command", "")).split())
+        return f"Bash: {cmd[:120]}" + ("…" if len(cmd) > 120 else "")
+    if name in ("Edit", "Write", "Read", "NotebookEdit", "MultiEdit"):
+        f = inp.get("file_path") or inp.get("notebook_path") or ""
+        return f"{name}: {os.path.basename(f)}" if f else name
+    if name == "AskUserQuestion":
+        qs = inp.get("questions") or []
+        q = qs[0].get("question", "") if qs and isinstance(qs[0], dict) else ""
+        return f"Pregunta: {q[:150]}" if q else "Te hace una pregunta"
+    if name == "ExitPlanMode":
+        return "Plan listo para revisar"
+    if name in ("WebFetch", "WebSearch"):
+        return f"{name}: {inp.get('url') or inp.get('query') or ''}"[:140]
+    if name.startswith("mcp__"):
+        parts = name.split("__")
+        return f"MCP {parts[1]}: {parts[-1]}" if len(parts) >= 3 else name
+    return name
+
+
+def plain_text(text):
+    """Markdown → texto plano, conservando rutas y código en línea."""
+    text = re.sub(r"```.*?```", " ", text, flags=re.S)
+    text = re.sub(r"(?m)^\s*\|.*\|\s*$", " ", text)
+    text = re.sub(r"!?\[([^\]]*)\]\([^)]*\)", r"\1", text)
+    text = re.sub(r"(?m)^\s*(#+|[-*+]|\d+\.)\s+", "", text)
+    text = re.sub(r"(?m)^\s*>\s?", "", text)
+    text = re.sub(r"[`*]+", "", text)
+    return re.sub(r"\s+", " ", text).strip()
+
+
+def dur(seconds):
+    d = int(seconds)
+    if d < 60:
+        return f"{d}s"
+    if d < 3600:
+        return f"{d // 60}m{d % 60:02d}s"
+    return f"{d // 3600}h{(d % 3600) // 60:02d}m"
+
+
 def cmd_hook():
     try:
         ev = json.load(sys.stdin)
@@ -234,19 +277,37 @@ def cmd_hook():
         s["prompt"] = prompt[:80] + ("…" if len(prompt) > 80 else "")
     elif name in ("PreToolUse", "PostToolUse"):
         new = "working"
+        if name == "PreToolUse":
+            s["tool"] = describe_tool(ev.get("tool_name", ""), ev.get("tool_input"))
     elif name == "Notification":
         ntype = ev.get("notification_type", "")
         msg = ev.get("message", "")
         if ntype == "idle_prompt" or "waiting for your input" in msg:
             # Claude lleva un rato inactivo; si ya estaba "done" lo dejamos así.
             new = old if old in ("done", "idle") else "waiting"
+            if new == "waiting":
+                s["message"] = "Te está esperando"
         else:
             new = "waiting"
-            s["message"] = msg
+            if "permission" in msg.lower() and s.get("tool"):
+                s["message"] = f"Pide permiso · {s['tool']}"
+            elif s.get("tool", "").startswith(("Pregunta", "Te hace", "Plan listo")):
+                s["message"] = s["tool"]
+            else:
+                s["message"] = msg
     elif name == "Stop":
         new = "done"
     elif name == "SubagentStop":
         pass
+
+    if new == "working" and old != "working":
+        s["work_started"] = now
+    if name == "Stop":
+        last = ev.get("last_assistant_message") or last_assistant_from_transcript(ev.get("transcript_path"))
+        clean = plain_text(last or "")
+        s["summary"] = first_sentences(clean, 2)[:220] if clean else ""
+        if s.get("work_started"):
+            s["took"] = now - s["work_started"]
 
     if new != old:
         s["status"] = new
@@ -272,11 +333,17 @@ def cmd_hook():
                     start_new_session=True,
                 )
     if NOTIFY and new != old and new in ("waiting", "done"):
-        body = s.get("message") if new == "waiting" else (s.get("prompt") or "Listo")
+        title = f"Claude · {s['project']} {LABEL[new]}"
+        if new == "waiting":
+            body = s.get("message") or "Necesita tu atención"
+        else:
+            body = s.get("summary") or s.get("prompt") or "Listo"
+            if s.get("took"):
+                title += f" · {dur(s['took'])}"
         subprocess.Popen(
             ["notify-send", "-a", "Claude Code", "-i", "dialog-information",
              "-u", "critical" if new == "waiting" else "normal",
-             f"Claude · {s['project']} {LABEL[new]}", body or ""],
+             title, html.escape(body, quote=False)],
             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True,
         )
 
@@ -546,7 +613,12 @@ def cmd_status():
     for s in sessions:
         st = s.get("status", "idle")
         title = titles.get(s.get("window"), "").lstrip("✳◐◓◑◒⠂⠐⠈⠁⠄⠠⠀ ").strip()
-        detail = s.get("message") if st == "waiting" else (title or s.get("prompt") or "")
+        if st == "waiting":
+            detail = s.get("message")
+        elif st == "done":
+            detail = s.get("summary") or title or s.get("prompt") or ""
+        else:
+            detail = title or s.get("prompt") or ""
         ctx = f" · ctx {s['ctx']}%" if s.get("ctx") is not None else ""
         lines.append(
             f"<span color='{C['dim']}'>{num[s['session_id']]}</span> "
