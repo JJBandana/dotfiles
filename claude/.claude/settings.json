@@ -123,7 +123,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "~/.local/bin/claude-waybar hook",
+            "command": "CLAUDE_WAYBAR_TTS=0 ~/.local/bin/claude-waybar hook",
             "timeout": 5
           }
         ]
